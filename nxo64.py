@@ -11,7 +11,7 @@
 # CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE
 # OR PERFORMANCE OF THIS SOFTWARE.
 
-# nxo64.py: IDA loader (and library for reading nso/nro files)
+# nxo64.py: IDA loader and library for reading nso/nro files
 
 import gzip, math, os, re, struct, sys
 
@@ -161,7 +161,7 @@ class SegmentBuilder(object):
             if i.range.includes(r):
                 i.add_section(Section(r, name))
                 return
-        assert False, "no containing segment for %r" % (name,)
+        assert False, 'no containing segment for %r' % (name,)
 
     def flatten(self):
         self.segments.sort(key=lambda s: s.range.start)
@@ -202,11 +202,11 @@ class ElfSym(object):
 
 class NxoFileBase(object):
     def __init__(self, f, tloc, tsize, rloc, rsize, dloc, dsize):
-        self.textoff    = tloc
-        self.textsize   = tsize
-        self.rodataoff  = rloc
+        self.textoff = tloc
+        self.textsize = tsize
+        self.rodataoff = rloc
         self.rodatasize = rsize
-        self.dataoff    = dloc
+        self.dataoff = dloc
         flatsize = dloc + dsize
 
 
@@ -233,10 +233,10 @@ class NxoFileBase(object):
 
         self.segment_builder = builder = SegmentBuilder()
         for off,sz,name,kind in [
-            (self.textoff, self.textsize, ".text", "CODE"),
-            (self.rodataoff, self.rodatasize, ".rodata", "CONST"),
-            (self.dataoff, self.datasize, ".data", "DATA"),
-            (self.bssoff, self.bsssize, ".bss", "BSS"),
+            (self.textoff, self.textsize, '.text', 'CODE'),
+            (self.rodataoff, self.rodatasize, '.rodata', 'CONST'),
+            (self.dataoff, self.datasize, '.data', 'DATA'),
+            (self.bssoff, self.bsssize, '.bss', 'BSS'),
         ]:
             builder.add_segment(off, sz, name, kind)
 
@@ -257,6 +257,7 @@ class NxoFileBase(object):
             else:
                 dynamic[tag] = val
         builder.add_section('.dynamic', self.dynamicoff, end=f.tell())
+        builder.add_section('.eh_frame_hdr', self.unwindoff, end=self.unwindend)
 
         # read .dynstr
         if DT_STRTAB in dynamic and DT_STRSZ in dynamic:
@@ -344,10 +345,47 @@ class NxoFileBase(object):
             if good:
                 builder.add_section('.got', plt_got_end, end=got_end)
 
+        self.eh_table = []
+        if not self.armv7:
+            f.seek(self.unwindoff)
+            version, eh_frame_ptr_enc, fde_count_enc, table_enc = f.read('BBBB')
+            if not any(i == 0xff for i in (eh_frame_ptr_enc, fde_count_enc, table_enc)): # DW_EH_PE_omit
+                #assert eh_frame_ptr_enc == 0x1B # DW_EH_PE_pcrel | DW_EH_PE_sdata4
+                #assert fde_count_enc == 0x03    # DW_EH_PE_absptr | DW_EH_PE_udata4
+                #assert table_enc == 0x3B        # DW_EH_PE_datarel | DW_EH_PE_sdata4
+                if eh_frame_ptr_enc == 0x1B and fde_count_enc == 0x03 and table_enc == 0x3B:
+                    base_offset = f.tell()
+                    eh_frame = base_offset + f.read('i')
+
+                    fde_count = f.read('I')
+                    #assert 8 * fde_count == self.unwindend - f.tell()
+                    if 8 * fde_count == self.unwindend - f.tell():
+                        for i in range(fde_count):
+                            pc = self.unwindoff + f.read('i')
+                            entry = self.unwindoff + f.read('i')
+                            self.eh_table.append((pc, entry))
+
         self.sections = []
         for start, end, name, kind in builder.flatten():
             self.sections.append((start, end, name, kind))
 
+        self._plt_lookup = None
+
+    @property
+    def plt_lookup(self):
+        if self._plt_lookup is None:
+            # generate lookups for .plt call redirection
+            got_value_lookup = {}
+            for offset, r_type, sym, addend in self.relocations:
+                if r_type in (R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_ABS64) and addend == 0 and sym.shndx:
+                    got_value_lookup[offset] = sym.value
+
+            self._plt_lookup = {}
+            for func, target in self.plt_entries:
+                if target in got_value_lookup:
+                    self._plt_lookup[func] = got_value_lookup[target]
+
+        return self._plt_lookup
 
     def process_relocations(self, f, symbols, offset, size):
         locations = set()
@@ -391,7 +429,6 @@ class NsoFile(NxoFileBase):
         tfilesize, rfilesize, dfilesize = f.read_from('III', 0x60)
         bsssize = f.read_from('I', 0x3C)
 
-        print 'load text: '
         text = uncompress(f.read_from(tfilesize, toff), uncompressed_size=tsize)
         ro   = uncompress(f.read_from(rfilesize, roff), uncompressed_size=rsize)
         data = uncompress(f.read_from(dfilesize, doff), uncompressed_size=dsize)
@@ -432,7 +469,6 @@ class NroFile(NxoFileBase):
 class NxoException(Exception):
     pass
 
-
 def load_nxo(fileobj):
     fileobj.seek(0)
     header = fileobj.read(0x14)
@@ -442,7 +478,7 @@ def load_nxo(fileobj):
     elif header[0x10:0x14] == 'NRO0':
         return NroFile(fileobj)
     else:
-        raise NxoException("not an NRO or NSO file")
+        raise NxoException('not an NRO or NSO file')
 
 
 try:
@@ -452,15 +488,78 @@ except ImportError:
     pass
 else:
     # IDA specific code
-    def accept_file(li, n):
-        if not isinstance(n, (int,long)) or n == 0:
-            li.seek(0)
-            if li.read(4) == 'NSO0':
-                return 'nxo64.py: Switch binary (NSO)'
-            li.seek(0x10)
-            if li.read(4) == 'NRO0':
-                return 'nxo64.py: Switch binary (NRO)'
-        return 0
+    NRO_FORMAT = 'Switch binary (NRO)'
+    NSO_FORMAT = 'Switch binary (NSO)'
+    SDK_FORMAT = 'Switch SDK binary (NSO, with arm64 .plt call rewriting hack)'
+    EXEFS_FORMAT = 'Switch exefs (multiple files, for use with Mephisto)'
+    EXEFS_LOW_FORMAT = 'Switch exefs with 31-bit addressing (multiple files, for use with Mephisto)'
+
+    OPT_BYPASS_PLT = 'BYPASS_PLT'
+    OPT_EXEFS_LOAD = 'EXEFS_LOAD'
+    OPT_LOAD_31_BIT = 'LOAD_31_BIT'
+
+    FORMAT_OPTIONS = {
+        NRO_FORMAT: [],
+        NSO_FORMAT: [],
+        SDK_FORMAT: [OPT_BYPASS_PLT],
+        EXEFS_FORMAT: [OPT_EXEFS_LOAD],
+        EXEFS_LOW_FORMAT: [OPT_EXEFS_LOAD, OPT_LOAD_31_BIT],
+    }
+
+    PRIMARY_EXEFS_NAMES = ['main', 'rtld', 'sdk']
+    LOAD_EXEFS_NAMES = PRIMARY_EXEFS_NAMES + ['subsdk%d' % i for i in range(10)]
+    ALL_EXEFS_NAMES = LOAD_EXEFS_NAMES + ['main.npdm']
+
+    def get_load_formats(li, path):
+        li.seek(0)
+        if li.read(4) == 'NSO0':
+            if 'sdk' in os.path.basename(path):
+                yield { 'format': SDK_FORMAT, 'options': idaapi.ACCEPT_FIRST }
+                yield { 'format': NSO_FORMAT }
+            else:
+                yield { 'format': NSO_FORMAT, 'options': idaapi.ACCEPT_FIRST }
+                yield { 'format': SDK_FORMAT }
+
+        li.seek(0x10)
+        if li.read(4) == 'NRO0':
+            yield { 'format': NRO_FORMAT, 'options': idaapi.ACCEPT_FIRST }
+
+        if os.path.basename(path) in ALL_EXEFS_NAMES:
+            dirname = os.path.dirname(path)
+            if all(os.path.exists(os.path.join(dirname, i)) for i in PRIMARY_EXEFS_NAMES):
+                yield { 'format': EXEFS_FORMAT }
+                yield { 'format': EXEFS_LOW_FORMAT }
+
+
+    # this is mostly just to work with the IDA API
+    accept_formats_list = None
+    accept_formats_index = 0
+
+    def accept_file(li, path):
+        global accept_formats_list
+        global accept_formats_index
+
+        if accept_formats_list is None:
+            accept_formats_list = list(get_load_formats(li, path))
+            accept_formats_index = 0
+
+        if accept_formats_index >= len(accept_formats_list):
+            accept_formats_list = None
+            accept_formats_index = 0
+            return 0
+
+        ret = accept_formats_list[accept_formats_index]
+        if not isinstance(ret, dict):
+            ret = { 'format': ret }
+        if 'options' not in ret:
+            ret['options'] = 1
+        if 'processor' not in ret:
+            ret['processor'] = 'arm'
+        ret['options'] |= 1 | idaapi.ACCEPT_CONTINUE
+
+        accept_formats_index += 1
+
+        return ret
 
     def ida_make_offset(f, ea):
         if f.armv7:
@@ -471,7 +570,8 @@ else:
 
     def find_bl_targets(text_start, text_end):
         targets = set()
-        for pc in range(text_start, text_end, 4):
+        for pco in xrange(0, text_end - text_start, 4):
+            pc = text_start + pco
             d = Dword(pc)
             if (d & 0xfc000000) == 0x94000000:
                 imm = d & 0x3ffffff
@@ -484,29 +584,63 @@ else:
                     targets.add(target)
         return targets
 
-    def load_file(li, neflags, format):
-        idaapi.set_processor_type("arm", SETPROC_ALL|SETPROC_FATAL)
+    def load_file(li, neflags, fmt):
+        idaapi.set_processor_type('arm', SETPROC_ALL|SETPROC_FATAL)
+
+        options = FORMAT_OPTIONS[fmt]
+
+        if OPT_EXEFS_LOAD in options:
+            return load_as_exefs(li, options)
+
+        return load_one_file(li, options, 0)
+
+    def load_as_exefs(li, options):
+        dirname = os.path.dirname(idc.get_input_file_path())
+        binaries = LOAD_EXEFS_NAMES
+        binaries = [os.path.join(dirname, i) for i in binaries]
+        binaries = [i for i in binaries if os.path.exists(i)]
+        for idx, fname in enumerate(binaries):
+            with open(fname, 'rb') as f:
+                if not load_one_file(f, options, idx, os.path.basename(fname)):
+                    return False
+        return True
+
+    def load_one_file(li, options, idx, basename=None):
+        bypass_plt = OPT_BYPASS_PLT in options
+
         f = load_nxo(li)
-        if f.armv7:
-            idc.SetShortPrm(idc.INF_LFLAGS, idc.GetShortPrm(idc.INF_LFLAGS) | idc.LFLG_PC_FLAT)
+
+        if idx == 0:
+            if f.armv7:
+                idc.SetShortPrm(idc.INF_LFLAGS, idc.GetShortPrm(idc.INF_LFLAGS) | idc.LFLG_PC_FLAT)
+            else:
+                idc.SetShortPrm(idc.INF_LFLAGS, idc.GetShortPrm(idc.INF_LFLAGS) | idc.LFLG_64BIT)
+
+            idc.SetCharPrm(idc.INF_DEMNAMES, idaapi.DEMNAM_GCC3)
+            idaapi.set_compiler_id(idaapi.COMP_GNU)
+            idaapi.add_til2('gnulnx_arm' if f.armv7 else 'gnulnx_arm64', 1)
+
+        if OPT_LOAD_31_BIT in options:
+            loadbase = 0x8000000
+            step = 0x1000000
+        elif f.armv7:
+            loadbase = 0x60000000
+            step = 0x10000000
         else:
-            idc.SetShortPrm(idc.INF_LFLAGS, idc.GetShortPrm(idc.INF_LFLAGS) | idc.LFLG_64BIT)
-
-        idc.SetCharPrm(idc.INF_DEMNAMES, idaapi.DEMNAM_GCC3)
-        idaapi.set_compiler_id(idaapi.COMP_GNU)
-        idaapi.add_til2('gnulnx_arm' if f.armv7 else 'gnulnx_arm64', 1)
-
-        loadbase = 0x60000000 if f.armv7 else 0x7100000000
+            loadbase = 0x7100000000
+            step = 0x100000000
+        loadbase += idx * step
 
         f.binfile.seek(0)
         as_string = f.binfile.read(f.bssoff)
         idaapi.mem2base(as_string, loadbase)
 
+        seg_prefix = basename if basename is not None else ''
         for start, end, name, kind in f.sections:
             if name.startswith('.got'):
                 kind = 'CONST'
-            idaapi.add_segm(0, loadbase+start, loadbase+end, name, kind)
-            segm = idaapi.get_segm_by_name(name)
+            idaapi.add_segm(0, loadbase+start, loadbase+end, seg_prefix+name, kind)
+            segm = idaapi.get_segm_by_name(seg_prefix+name)
             if kind == 'CONST':
                 segm.perm = idaapi.SEGPERM_READ
             elif kind == 'CODE':
@@ -527,8 +661,10 @@ else:
         last_ea = max(loadbase + end for start, end, name, kind in f.sections)
         undef_entry_size = 8
         undef_ea = ((last_ea + 0xFFF) & ~0xFFF) + undef_entry_size # plus 8 so we don't end up on the "end" symbol
-        idaapi.add_segm(0, undef_ea, undef_ea+undef_count*undef_entry_size, "UNDEF", "XTRN")
-        segm = idaapi.get_segm_by_name("UNDEF")
+
+        undef_seg = basename + '.UNDEF' if basename is not None else 'UNDEF'
+        idaapi.add_segm(0, undef_ea, undef_ea+undef_count*undef_entry_size, undef_seg, 'XTRN')
+        segm = idaapi.get_segm_by_name(undef_seg)
         segm.type = idaapi.SEG_XTRN
         idaapi.update_segm(segm)
         for i,s in enumerate(f.symbols):
@@ -542,7 +678,6 @@ else:
                 s.resolved = loadbase + s.value
                 if s.name:
                     if s.type == STT_FUNC:
-                        print hex(s.resolved), s.name
                         idaapi.add_entry(s.resolved, s.resolved, s.name, 0)
                     else:
                         idaapi.do_name_anyway(s.resolved, s.name)
@@ -585,7 +720,34 @@ else:
                 funcs.add(addr)
                 idaapi.do_name_anyway(addr, got_name_lookup[target])
 
-        funcs |= find_bl_targets(loadbase, loadbase+f.textsize)
+        if not f.armv7:
+            funcs |= find_bl_targets(loadbase, loadbase+f.textsize)
+
+            if bypass_plt:
+                plt_lookup = f.plt_lookup
+                for pco in xrange(0, f.textsize, 4):
+                    pc = loadbase + pco
+                    d = Dword(pc)
+                    if (d & 0x7c000000) == (0x94000000 & 0x7c000000):
+                        imm = d & 0x3ffffff
+                        if imm & 0x2000000:
+                            imm |= ~0x1ffffff
+                        if 0 <= imm <= 2:
+                            continue
+                        target = (pc + imm * 4) - loadbase
+                        if target in plt_lookup:
+                            new_target = plt_lookup[target] + loadbase
+                            new_instr = (d & ~0x3ffffff) | (((new_target - pc) / 4) & 0x3ffffff)
+                            idaapi.put_long(pc, new_instr)
+
+            for pco in xrange(0, f.textsize, 4):
+                pc = loadbase + pco
+                d = Dword(pc)
+                if d == 0x14000001:
+                    funcs.add(pc + 4)
+
+        for pc, _ in f.eh_table:
+            funcs.add(loadbase + pc)
 
         for addr in sorted(funcs, reverse=True):
             idc.AutoMark(addr, AU_CODE)

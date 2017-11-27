@@ -365,6 +365,10 @@ class NxoFileBase(object):
                             entry = self.unwindoff + f.read('i')
                             self.eh_table.append((pc, entry))
 
+                    # TODO: we miss the last one, but better than nothing
+                    last_entry = sorted(self.eh_table, key=lambda x: x[1])[-1][1]
+                    builder.add_section('.eh_frame', eh_frame, end=last_entry)
+
         self.sections = []
         for start, end, name, kind in builder.flatten():
             self.sections.append((start, end, name, kind))
@@ -465,6 +469,84 @@ class NroFile(NxoFileBase):
 
         super(NroFile, self).__init__(f, tloc, tsize, rloc, rsize, dloc, dsize)
 
+def kip1_blz_decompress(compressed):
+    compressed_size, init_index, uncompressed_addl_size = struct.unpack('<III', compressed[-0xC:])
+    decompressed = compressed[:] + '\x00' * uncompressed_addl_size
+    decompressed_size = len(decompressed)
+    if not (compressed_size + uncompressed_addl_size):
+        return ''
+    compressed = map(ord, compressed)
+    decompressed = map(ord, decompressed)
+    index = compressed_size - init_index
+    outindex = decompressed_size
+    while outindex > 0:
+        index -= 1
+        control = compressed[index]
+        for i in xrange(8):
+            if control & 0x80:
+                if index < 2:
+                    raise ValueError('Compression out of bounds!')
+                index -= 2
+                segmentoffset = compressed[index] | (compressed[index+1] << 8)
+                segmentsize = ((segmentoffset >> 12) & 0xF) + 3
+                segmentoffset &= 0x0FFF
+                segmentoffset += 2
+                if outindex < segmentsize:
+                    raise ValueError('Compression out of bounds!')
+                for j in xrange(segmentsize):
+                    if outindex + segmentoffset >= decompressed_size:
+                        raise ValueError('Compression out of bounds!')
+                    data = decompressed[outindex+segmentoffset]
+                    outindex -= 1
+                    decompressed[outindex] = data
+            else:
+                if outindex < 1:
+                    raise ValueError('Compression out of bounds!')
+                outindex -= 1
+                index -= 1
+                decompressed[outindex] = compressed[index]
+            control <<= 1
+            control &= 0xFF
+            if not outindex:
+                break
+    return ''.join(map(chr, decompressed))
+
+class KipFile(NxoFileBase):
+    def __init__(self, fileobj):
+        f = BinFile(fileobj)
+
+        if f.read_from('4s', 0) != 'KIP1':
+            raise NxoException('Invalid KIP magic')
+
+        tloc, tsize, tfilesize = f.read_from('III', 0x20)
+        rloc, rsize, rfilesize = f.read_from('III', 0x30)
+        dloc, dsize, dfilesize = f.read_from('III', 0x40)
+
+        toff = 0x100
+        roff = toff + tfilesize
+        doff = roff + rfilesize
+
+        bsssize = f.read_from('I', 0x18)
+
+        text = kip1_blz_decompress(str(f.read_from(tfilesize, toff)))
+        ro   = kip1_blz_decompress(str(f.read_from(rfilesize, roff)))
+        data = kip1_blz_decompress(str(f.read_from(dfilesize, doff)))
+
+        full = text
+        if rloc >= len(full):
+            full += '\0' * (rloc - len(full))
+        else:
+            print 'truncating?'
+            full = full[:rloc]
+        full += ro
+        if dloc >= len(full):
+            full += '\0' * (dloc - len(full))
+        else:
+            print 'truncating?'
+            full = full[:dloc]
+        full += data
+
+        super(KipFile, self).__init__(BinFile(StringIO(full)), tloc, tsize, rloc, rsize, dloc, dsize)
 
 class NxoException(Exception):
     pass
@@ -475,6 +557,8 @@ def load_nxo(fileobj):
 
     if header[:4] == 'NSO0':
         return NsoFile(fileobj)
+    elif header[:4] == 'KIP1':
+        return KipFile(fileobj)
     elif header[0x10:0x14] == 'NRO0':
         return NroFile(fileobj)
     else:
@@ -490,6 +574,7 @@ else:
     # IDA specific code
     NRO_FORMAT = 'Switch binary (NRO)'
     NSO_FORMAT = 'Switch binary (NSO)'
+    KIP_FORMAT = 'Switch binary (KIP)'
     SDK_FORMAT = 'Switch SDK binary (NSO, with arm64 .plt call rewriting hack)'
     EXEFS_FORMAT = 'Switch exefs (multiple files, for use with Mephisto)'
     EXEFS_LOW_FORMAT = 'Switch exefs with 31-bit addressing (multiple files, for use with Mephisto)'
@@ -501,6 +586,7 @@ else:
     FORMAT_OPTIONS = {
         NRO_FORMAT: [],
         NSO_FORMAT: [],
+        KIP_FORMAT: [],
         SDK_FORMAT: [OPT_BYPASS_PLT],
         EXEFS_FORMAT: [OPT_EXEFS_LOAD],
         EXEFS_LOW_FORMAT: [OPT_EXEFS_LOAD, OPT_LOAD_31_BIT],
@@ -519,6 +605,10 @@ else:
             else:
                 yield { 'format': NSO_FORMAT, 'options': idaapi.ACCEPT_FIRST }
                 yield { 'format': SDK_FORMAT }
+
+        li.seek(0)
+        if li.read(4) == 'KIP1':
+                yield { 'format': KIP_FORMAT, 'options': idaapi.ACCEPT_FIRST }
 
         li.seek(0x10)
         if li.read(4) == 'NRO0':
@@ -590,9 +680,17 @@ else:
         options = FORMAT_OPTIONS[fmt]
 
         if OPT_EXEFS_LOAD in options:
-            return load_as_exefs(li, options)
+            ret = load_as_exefs(li, options)
+        else:
+            ret = load_one_file(li, options, 0)
 
-        return load_one_file(li, options, 0)
+        eh_parse = idaapi.find_plugin('eh_parse', True)
+        if eh_parse:
+            print 'eh_parse ->', idaapi.run_plugin(eh_parse, 0)
+        else:
+            print 'warning: eh_parse missing'
+
+        return ret
 
     def load_as_exefs(li, options):
         dirname = os.path.dirname(idc.get_input_file_path())
@@ -619,6 +717,8 @@ else:
             idc.SetCharPrm(idc.INF_DEMNAMES, idaapi.DEMNAM_GCC3)
             idaapi.set_compiler_id(idaapi.COMP_GNU)
             idaapi.add_til2('gnulnx_arm' if f.armv7 else 'gnulnx_arm64', 1)
+            # don't create tails
+            idc.set_inf_attr(idc.INF_AF, idc.get_inf_attr(idc.INF_AF) & ~idc.AF_FTAIL)
 
         if OPT_LOAD_31_BIT in options:
             loadbase = 0x8000000
@@ -691,6 +791,9 @@ else:
             if s.name and s.shndx and s.value:
                 if s.type == STT_FUNC:
                     funcs.add(loadbase+s.value)
+                    symend = loadbase+s.value+s.size
+                    if Dword(symend) != 0:
+                        funcs.add(symend)
 
         got_name_lookup = {}
         for offset, r_type, sym, addend in f.relocations:
@@ -750,7 +853,6 @@ else:
             funcs.add(loadbase + pc)
 
         for addr in sorted(funcs, reverse=True):
-            idc.AutoMark(addr, AU_CODE)
-            idc.AutoMark(addr, AU_PROC)
+            idaapi.auto_make_proc(addr)
 
         return 1
